@@ -1,0 +1,15 @@
+# Interfaz de usuario
+streamlit>=1.32.0
+
+# Base de datos vectorial
+chromadb>=0.4.24
+
+# SDK de Google Gemini para LLM
+google-generativeai>=0.4.0
+
+# Validación de datos (Requerido por Chroma y GenAI internamente)
+pydantic>=2.6.0
+
+# PARCHE DE INFRAESTRUCTURA: Necesario para entornos de despliegue
+# (como Streamlit Cloud o Linux antiguos) que tienen versiones de SQLite < 3.35
+pysqlite3-binary>=0.5.2.post3
