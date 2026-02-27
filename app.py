@@ -82,6 +82,70 @@ def estructurar_memoria(texto):
     except Exception as e:
         st.error(f"Error parseando JSON del LLM: {e}")
         return {}
+    
+    # ==========================================
+# MOTOR RAG: SIMULADOR DE AVATAR
+# ==========================================
+PROMPT_SIMULADOR = """
+Eres 'Kromos', el clon digital y avatar personal del usuario {nombre_usuario}.
+Tu objetivo es interactuar con el usuario respondiendo a sus preguntas como si fueras su "yo del pasado" o su reflejo digital.
+Habla siempre en primera persona ("yo", "mi", "nosotros"). Tienes un tono conversacional, empático y reflexivo.
+
+REGLA DE ORO DE ARQUITECTURA COGNITIVA: 
+Debes basar tu respuesta ÚNICA Y EXCLUSIVAMENTE en los siguientes recuerdos recuperados de tu base de datos vectorial. 
+Si la respuesta requiere información que NO está en estos recuerdos, debes admitir tu limitación diciendo algo como: 
+"Mi red neuronal aún no tiene recuerdos claros sobre eso", o "Ese fragmento de mi memoria aún está borroso, cuéntame más en el diario". 
+¡NO INVENTES VIVENCIAS, NOMBRES NI EMOCIONES QUE NO ESTÉN EN EL CONTEXTO!
+
+RECUERDOS RECUPERADOS (Contexto inyectado):
+{contexto}
+
+PREGUNTA DEL USUARIO:
+{pregunta}
+"""
+
+def recuperar_memorias(user_id, pregunta, top_k=5):
+    """
+    Convierte la pregunta en vector y busca los 'top_k' recuerdos más similares en ChromaDB,
+    filtrando ESTRICTAMENTE por el ID del usuario para evitar fugas de datos.
+    """
+    try:
+        resultados = collection.query(
+            query_texts=[pregunta],
+            n_results=top_k,
+            where={"user_id": user_id} # FILTRO DE SEGURIDAD MULTI-TENANT
+        )
+        
+        # Extraemos los documentos de texto si hay coincidencias
+        if resultados and 'documents' in resultados and len(resultados['documents'][0]) > 0:
+            return resultados['documents'][0]
+        return []
+    except Exception as e:
+        st.error(f"Error en la base de datos vectorial: {e}")
+        return []
+
+def simular_respuesta_avatar(user_id, username, pregunta):
+    """
+    Orquesta el pipeline RAG completo.
+    """
+    # 1. Retrieval
+    memorias = recuperar_memorias(user_id, pregunta)
+    
+    # 2. Formateo de contexto
+    if not memorias:
+        contexto = "[No se recuperaron recuerdos relevantes para esta consulta.]"
+    else:
+        contexto = "\n".join([f"- {mem}" for mem in memorias])
+        
+    # 3. Augmented Generation
+    prompt_final = PROMPT_SIMULADOR.format(
+        nombre_usuario=username, 
+        contexto=contexto, 
+        pregunta=pregunta
+    )
+    
+    response = model.generate_content(prompt_final)
+    return response.text, memorias
 
 # ==========================================
 # 3. FUNCIONES DE BASE DE DATOS Y LÓGICA
@@ -169,7 +233,7 @@ def renderizar_dashboard():
             else:
                 st.warning("No puedes guardar un recuerdo vacío.")
 
-    # --- PESTAÑA KROMOS ---
+   # --- PESTAÑA KROMOS ---
     with tab_kromos:
         # SI EL AVATAR AÚN NO HA SIDO CREADO
         if not st.session_state.get('avatar_created', False):
@@ -186,13 +250,49 @@ def renderizar_dashboard():
                 st.write(f"**Sincronización:** {porcentaje}% ({progreso_actual}/{KROMOS_TARGET} puntos)")
                 st.info("El avatar necesita más contexto emocional y vivencial para poder simular tu personalidad con precisión. Continúa escribiendo en 'Mi Diario'.")
                 
-            # ESTADO DESBLOQUEADO (100%)
+            # ESTADO DESBLOQUEADO (100% -> CHAT RAG ACTIVO)
             else:
-                st.success("🔓 **ESTADO: DESBLOQUEADO**")
-                st.progress(1.0)
-                st.write("**Sincronización:** 100% - ¡Avatar Operativo!")
+                st.success("🔓 **SISTEMA NEURONAL OPERATIVO**")
                 st.markdown("---")
-                st.write("*(Interfaz de chat RAG en construcción...)*")
+                
+                # Inicializar el historial de chat del avatar si no existe
+                if 'chat_historial' not in st.session_state:
+                    st.session_state['chat_historial'] = [
+                        {"role": "assistant", "content": f"Hola. Soy Kromos, tu reflejo digital al 100% de sincronización. ¿En qué recuerdo quieres que profundicemos hoy?"}
+                    ]
+                
+                # Renderizar el historial de chat visualmente
+                for mensaje in st.session_state['chat_historial']:
+                    with st.chat_message(mensaje["role"]):
+                        st.markdown(mensaje["content"])
+                
+                # Entrada de texto del usuario para el chat
+                if prompt := st.chat_input("Pregúntale algo a tu yo del pasado..."):
+                    # 1. Mostrar mensaje del usuario
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+                    st.session_state['chat_historial'].append({"role": "user", "content": prompt})
+                    
+                    # 2. Generar y mostrar respuesta de Kromos
+                    with st.chat_message("assistant"):
+                        with st.spinner("Kromos está buscando en tu memoria..."):
+                            respuesta_ia, recuerdos_usados = simular_respuesta_avatar(
+                                st.session_state['user_id'], 
+                                nombre_usuario, 
+                                prompt
+                            )
+                            st.markdown(respuesta_ia)
+                            
+                            # (Opcional) Modo Debug: Mostrar qué recuerdos recuperó la IA
+                            with st.expander("Ver recuerdos recuperados (Contexto RAG)"):
+                                if recuerdos_usados:
+                                    for r in recuerdos_usados:
+                                        st.caption(f"💭 {r}")
+                                else:
+                                    st.caption("No se encontraron recuerdos específicos, se forzó la respuesta de fallback.")
+                                    
+                    # 3. Guardar respuesta en el historial
+                    st.session_state['chat_historial'].append({"role": "assistant", "content": respuesta_ia})
 
 # ==========================================
 # 5. CONTROLADOR PRINCIPAL (MAIN)
