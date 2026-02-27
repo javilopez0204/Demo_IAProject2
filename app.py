@@ -9,6 +9,7 @@ import streamlit as st
 import sqlite3
 import hashlib
 import json
+import time
 from datetime import datetime
 import google.generativeai as genai
 import chromadb
@@ -16,21 +17,27 @@ import chromadb
 # ==========================================
 # 1. CONFIGURACIÓN Y CONEXIONES
 # ==========================================
-# Configura tu API Key de Gemini aquí (idealmente usar st.secrets)
-# Usar el manejador de secretos de Streamlit
-api_key = st.secrets["GEMINI_API_KEY"]
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-2.5-flash') # Modelo rápido y eficiente para estructuración
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    genai.configure(api_key=api_key)
+except KeyError:
+    st.error("🚨 Error crítico: La clave 'GEMINI_API_KEY' no está configurada en los secretos de Streamlit.")
+    st.stop()
 
-# Inicializar ChromaDB (Local)
+model = genai.GenerativeModel('gemini-2.5-flash')
+
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(name="user_memories")
 
-# Inicializar SQLite
 conn = sqlite3.connect('temporal_eco.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS users
-             (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, onboarding_done BOOLEAN)''')
+             (id INTEGER PRIMARY KEY, 
+              username TEXT UNIQUE, 
+              password TEXT, 
+              onboarding_done BOOLEAN, 
+              kromos_score INTEGER DEFAULT 0,
+              avatar_created BOOLEAN DEFAULT 0)''')
 conn.commit()
 
 # ==========================================
@@ -56,7 +63,6 @@ Entrada del usuario:
 def estructurar_memoria(texto):
     response = model.generate_content(PROMPT_ESTRUCTURADOR + texto)
     try:
-        # Limpiar posible formato Markdown de la respuesta del LLM
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
         return json.loads(clean_json)
     except Exception as e:
@@ -64,58 +70,129 @@ def estructurar_memoria(texto):
         return {}
 
 # ==========================================
-# 3. FUNCIONES DE BASE DE DATOS Y ESTADO
+# 3. FUNCIONES DE BASE DE DATOS Y LÓGICA
 # ==========================================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def login_user(username, password):
-    c.execute("SELECT id, onboarding_done FROM users WHERE username=? AND password=?", (username, hash_password(password)))
-    return c.fetchone()
-
 def register_user(username, password):
     try:
-        c.execute("INSERT INTO users (username, password, onboarding_done) VALUES (?, ?, ?)", 
-                  (username, hash_password(password), False))
+        c.execute("INSERT INTO users (username, password, onboarding_done, kromos_score, avatar_created) VALUES (?, ?, ?, ?, ?)", 
+                  (username, hash_password(password), False, 0, False))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False
 
+# MODIFICACIÓN: Ahora recuperamos el username en la posición 1
+def login_user(username, password):
+    c.execute("SELECT id, username, onboarding_done, kromos_score, avatar_created FROM users WHERE username=? AND password=?", 
+              (username, hash_password(password)))
+    return c.fetchone()
+
 def guardar_memoria(user_id, texto):
-    # 1. Pasar por el LLM para estructurar
     metadatos = estructurar_memoria(texto)
-    
-    # 2. Guardar en Vector DB (ChromaDB genera el embedding automáticamente por defecto)
     doc_id = f"{user_id}_{datetime.now().timestamp()}"
+    score_obtenido = metadatos.get("importance_score", 1)
     
-    # Preparamos los metadatos para ChromaDB (no soporta listas directamente, las convertimos a strings separados por comas)
     chroma_meta = {
         "user_id": user_id,
         "date": datetime.now().isoformat(),
         "emotions": ",".join(metadatos.get("emotions", [])),
         "people": ",".join(metadatos.get("people_mentioned", [])),
-        "importance": metadatos.get("importance_score", 1)
+        "importance": score_obtenido
     }
+    collection.add(documents=[texto], metadatas=[chroma_meta], ids=[doc_id])
     
-    collection.add(
-        documents=[texto],
-        metadatas=[chroma_meta],
-        ids=[doc_id]
-    )
+    c.execute("UPDATE users SET kromos_score = kromos_score + ? WHERE id = ?", (score_obtenido, user_id))
+    conn.commit()
+    st.session_state['kromos_score'] += score_obtenido
+    
     return metadatos
 
 # ==========================================
-# 4. INTERFAZ DE STREAMLIT (UI/UX)
+# 4. COMPONENTES DE INTERFAZ (UI)
+# ==========================================
+def renderizar_dashboard():
+    st.subheader("Tu Espacio Personal")
+    
+    if st.button("Cerrar Sesión"):
+        st.session_state.clear()
+        st.rerun()
+
+    KROMOS_TARGET = 50 
+    progreso_actual = min(st.session_state.get('kromos_score', 0), KROMOS_TARGET)
+    porcentaje = int((progreso_actual / KROMOS_TARGET) * 100)
+    
+    # Extraemos el nombre del usuario para el avatar
+    nombre_usuario = st.session_state.get('username', 'Usuario')
+
+    tab_diario, tab_kromos = st.tabs(["📝 Mi Diario", "🧠 Kromos (Avatar)"])
+
+    # --- PESTAÑA DIARIO ---
+    with tab_diario:
+        nueva_entrada = st.text_area("¿Qué tienes en mente hoy? Escribe cómo te sientes, qué pasó, o reflexiones aleatorias.")
+        
+        if st.button("Guardar en la Cápsula"):
+            if nueva_entrada:
+                with st.spinner("Procesando memoria e integrando en la red neuronal..."):
+                    meta = guardar_memoria(st.session_state['user_id'], nueva_entrada)
+                    puntos = meta.get('importance_score', 1)
+                    
+                    # LOGICA DE CREACIÓN DEL AVATAR (Primera vez)
+                    if not st.session_state.get('avatar_created', False):
+                        c.execute("UPDATE users SET avatar_created = 1 WHERE id = ?", (st.session_state['user_id'],))
+                        conn.commit()
+                        st.session_state['avatar_created'] = True
+                        st.balloons()
+                        st.success("✨ ¡Tu Avatar ha sido creado! Revisa la pestaña 'Kromos'.")
+                        time.sleep(1.5) # Pequeña pausa para que el usuario lea el mensaje
+                        st.rerun() # FORZAMOS EL RE-RENDERIZADO PARA ACTUALIZAR LA OTRA PESTAÑA
+                    else:
+                        st.success(f"Memoria guardada. ¡Avatar sincronizado +{puntos} puntos!")
+                        time.sleep(1)
+                        st.rerun() # Forzamos recarga para ver avanzar la barra
+            else:
+                st.warning("No puedes guardar un recuerdo vacío.")
+
+    # --- PESTAÑA KROMOS ---
+    with tab_kromos:
+        # SI EL AVATAR AÚN NO HA SIDO CREADO
+        if not st.session_state.get('avatar_created', False):
+            st.info("🧬 **No hay ningún avatar asignado.**\n\nVe a 'Mi Diario' y escribe tu primera entrada libre para inicializar el núcleo de tu avatar.")
+            
+        # SI EL AVATAR YA ESTÁ CREADO
+        else:
+            st.markdown(f"## 👤 Avatar: {nombre_usuario}")
+            
+            # ESTADO BLOQUEADO (< 100%)
+            if porcentaje < 100:
+                st.error("🔒 **ESTADO: BLOQUEADO**")
+                st.progress(porcentaje / 100.0)
+                st.write(f"**Sincronización:** {porcentaje}% ({progreso_actual}/{KROMOS_TARGET} puntos)")
+                st.info("El avatar necesita más contexto emocional y vivencial para poder simular tu personalidad con precisión. Continúa escribiendo en 'Mi Diario'.")
+                
+            # ESTADO DESBLOQUEADO (100%)
+            else:
+                st.success("🔓 **ESTADO: DESBLOQUEADO**")
+                st.progress(1.0)
+                st.write("**Sincronización:** 100% - ¡Avatar Operativo!")
+                st.markdown("---")
+                st.write("*(Interfaz de chat RAG en construcción...)*")
+
+# ==========================================
+# 5. CONTROLADOR PRINCIPAL (MAIN)
 # ==========================================
 def main():
-    st.title("⏳ Cápsula del Tiempo IA - Demo MVP")
+    st.title("⏳ Cápsula del Tiempo IA")
 
-    # Inicializar estado de sesión
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['user_id'] = None
+        st.session_state['username'] = None
         st.session_state['onboarding_done'] = False
+        st.session_state['kromos_score'] = 0
+        st.session_state['avatar_created'] = False
 
     # PANTALLA DE LOGIN / REGISTRO
     if not st.session_state['logged_in']:
@@ -129,7 +206,10 @@ def main():
                 if user_data:
                     st.session_state['logged_in'] = True
                     st.session_state['user_id'] = user_data[0]
-                    st.session_state['onboarding_done'] = user_data[1]
+                    st.session_state['username'] = user_data[1] # Guardamos el nombre
+                    st.session_state['onboarding_done'] = user_data[2]
+                    st.session_state['kromos_score'] = user_data[3]
+                    st.session_state['avatar_created'] = bool(user_data[4])
                     st.rerun()
                 else:
                     st.error("Credenciales incorrectas")
@@ -143,11 +223,9 @@ def main():
                 else:
                     st.error("El usuario ya existe.")
 
-    # PANTALLA DE ONBOARDING (Cuestionario Base)
+    # PANTALLA DE ONBOARDING
     elif not st.session_state['onboarding_done']:
-        st.subheader("Cuestionario de Inicialización (Modo Entrevistador)")
-        st.write("Para que tu futura IA pueda simularte, necesitamos un contexto base.")
-        
+        st.subheader("Cuestionario de Inicialización")
         with st.form("onboarding_form"):
             q1 = st.text_area("1. ¿Cuáles son tus valores principales en la vida?")
             q2 = st.text_area("2. Describe un evento de tu pasado que te cambió profundamente.")
@@ -156,7 +234,7 @@ def main():
             submitted = st.form_submit_button("Guardar mi perfil base")
             if submitted:
                 if q1 and q2 and q3:
-                    with st.spinner("Procesando y guardando memorias base..."):
+                    with st.spinner("Procesando memorias base..."):
                         guardar_memoria(st.session_state['user_id'], f"Valores principales: {q1}")
                         guardar_memoria(st.session_state['user_id'], f"Evento que me cambió: {q2}")
                         guardar_memoria(st.session_state['user_id'], f"Miedos y esperanzas: {q3}")
@@ -164,29 +242,15 @@ def main():
                         c.execute("UPDATE users SET onboarding_done = 1 WHERE id = ?", (st.session_state['user_id'],))
                         conn.commit()
                         st.session_state['onboarding_done'] = True
-                        st.success("¡Perfil base creado!")
+                        st.success("¡Perfil base creado! Pasando a tu cápsula...")
+                        time.sleep(1)
                         st.rerun()
                 else:
                     st.warning("Por favor responde a todas las preguntas para inicializar tu perfil.")
 
-    # PANTALLA PRINCIPAL (Diario / Ingestión de Contexto)
+    # DASHBOARD PRINCIPAL
     else:
-        st.subheader("Tu Diario de Vida")
-        if st.button("Cerrar Sesión"):
-            st.session_state.clear()
-            st.rerun()
-
-        nueva_entrada = st.text_area("¿Qué tienes en mente hoy? Escribe cómo te sientes, qué pasó, o reflexiones aleatorias.")
-        
-        if st.button("Guardar en la Cápsula"):
-            if nueva_entrada:
-                with st.spinner("El Estructurador IA está analizando tu memoria..."):
-                    meta = guardar_memoria(st.session_state['user_id'], nueva_entrada)
-                    st.success("Memoria guardada y estructurada exitosamente.")
-                    with st.expander("Ver metadatos extraídos por la IA (Modo Debug)"):
-                        st.json(meta)
-            else:
-                st.warning("No puedes guardar un recuerdo vacío.")
+        renderizar_dashboard()
 
 if __name__ == '__main__':
     main()
