@@ -31,13 +31,27 @@ collection = chroma_client.get_or_create_collection(name="user_memories")
 
 conn = sqlite3.connect('temporal_eco.db', check_same_thread=False)
 c = conn.cursor()
+
+# 1. Creamos la tabla base si es un despliegue 100% nuevo
 c.execute('''CREATE TABLE IF NOT EXISTS users
              (id INTEGER PRIMARY KEY, 
               username TEXT UNIQUE, 
               password TEXT, 
-              onboarding_done BOOLEAN, 
-              kromos_score INTEGER DEFAULT 0,
-              avatar_created BOOLEAN DEFAULT 0)''')
+              onboarding_done BOOLEAN)''')
+
+# 2. SISTEMA DE MIGRACIÓN AUTOMÁTICA
+# Intentamos añadir las nuevas columnas a la tabla existente. 
+# Si ya existen, SQLite lanzará un error que ignoramos silenciosamente.
+try:
+    c.execute("ALTER TABLE users ADD COLUMN kromos_score INTEGER DEFAULT 0")
+except Exception:
+    pass # La columna kromos_score ya existía
+
+try:
+    c.execute("ALTER TABLE users ADD COLUMN avatar_created BOOLEAN DEFAULT 0")
+except Exception:
+    pass # La columna avatar_created ya existía
+
 conn.commit()
 
 # ==========================================
