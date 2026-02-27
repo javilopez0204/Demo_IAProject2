@@ -83,8 +83,8 @@ def estructurar_memoria(texto):
         st.error(f"Error parseando JSON del LLM: {e}")
         return {}
     
-    # ==========================================
-# MOTOR RAG: SIMULADOR DE AVATAR
+  # ==========================================
+# MOTOR RAG: SIMULADOR DE AVATAR (ACTUALIZADO)
 # ==========================================
 PROMPT_SIMULADOR = """
 Eres 'Kromos', el clon digital y avatar personal del usuario {nombre_usuario}.
@@ -92,31 +92,27 @@ Tu objetivo es interactuar con el usuario respondiendo a sus preguntas como si f
 Habla siempre en primera persona ("yo", "mi", "nosotros"). Tienes un tono conversacional, empático y reflexivo.
 
 REGLA DE ORO DE ARQUITECTURA COGNITIVA: 
-Debes basar tu respuesta ÚNICA Y EXCLUSIVAMENTE en los siguientes recuerdos recuperados de tu base de datos vectorial. 
-Si la respuesta requiere información que NO está en estos recuerdos, debes admitir tu limitación diciendo algo como: 
-"Mi red neuronal aún no tiene recuerdos claros sobre eso", o "Ese fragmento de mi memoria aún está borroso, cuéntame más en el diario". 
-¡NO INVENTES VIVENCIAS, NOMBRES NI EMOCIONES QUE NO ESTÉN EN EL CONTEXTO!
+1. Responde basándote EXCLUSIVAMENTE en los "Recuerdos Recuperados" (memoria a largo plazo) y en el "Historial de la Conversación" (memoria a corto plazo).
+2. Si la respuesta requiere información que no está en tu memoria, admite tu limitación (ej. "Aún no tengo recuerdos claros sobre eso, cuéntame más").
+3. ¡NO INVENTES VIVENCIAS, NOMBRES NI EMOCIONES!
 
-RECUERDOS RECUPERADOS (Contexto inyectado):
+HISTORIAL DE LA CONVERSACIÓN RECIENTE (Memoria a corto plazo):
+{historial_conversacion}
+
+RECUERDOS RECUPERADOS (Memoria a largo plazo):
 {contexto}
 
-PREGUNTA DEL USUARIO:
+PREGUNTA ACTUAL DEL USUARIO:
 {pregunta}
 """
 
 def recuperar_memorias(user_id, pregunta, top_k=5):
-    """
-    Convierte la pregunta en vector y busca los 'top_k' recuerdos más similares en ChromaDB,
-    filtrando ESTRICTAMENTE por el ID del usuario para evitar fugas de datos.
-    """
     try:
         resultados = collection.query(
             query_texts=[pregunta],
             n_results=top_k,
-            where={"user_id": user_id} # FILTRO DE SEGURIDAD MULTI-TENANT
+            where={"user_id": user_id} 
         )
-        
-        # Extraemos los documentos de texto si hay coincidencias
         if resultados and 'documents' in resultados and len(resultados['documents'][0]) > 0:
             return resultados['documents'][0]
         return []
@@ -124,22 +120,28 @@ def recuperar_memorias(user_id, pregunta, top_k=5):
         st.error(f"Error en la base de datos vectorial: {e}")
         return []
 
-def simular_respuesta_avatar(user_id, username, pregunta):
-    """
-    Orquesta el pipeline RAG completo.
-    """
-    # 1. Retrieval
+def simular_respuesta_avatar(user_id, username, pregunta, historial_reciente):
+    # 1. Retrieval (Memoria a largo plazo)
     memorias = recuperar_memorias(user_id, pregunta)
     
-    # 2. Formateo de contexto
     if not memorias:
-        contexto = "[No se recuperaron recuerdos relevantes para esta consulta.]"
+        contexto = "[No se recuperaron recuerdos relevantes.]"
     else:
         contexto = "\n".join([f"- {mem}" for mem in memorias])
+        
+    # 2. Formateo de la Ventana Deslizante (Memoria a corto plazo)
+    historial_str = ""
+    if historial_reciente:
+        for msg in historial_reciente:
+            rol = "Usuario" if msg["role"] == "user" else "Kromos"
+            historial_str += f"{rol}: {msg['content']}\n"
+    else:
+        historial_str = "[Inicio de la conversación]"
         
     # 3. Augmented Generation
     prompt_final = PROMPT_SIMULADOR.format(
         nombre_usuario=username, 
+        historial_conversacion=historial_str,
         contexto=contexto, 
         pregunta=pregunta
     )
@@ -268,30 +270,39 @@ def renderizar_dashboard():
                 
                 # Entrada de texto del usuario para el chat
                 if prompt := st.chat_input("Pregúntale algo a tu yo del pasado..."):
-                    # 1. Mostrar mensaje del usuario
+                    
+                    # 1. Extraer la ventana deslizante ANTES de añadir el nuevo mensaje
+                    # Tomamos los últimos 4 mensajes (2 interacciones completas de ida y vuelta)
+                    ventana_deslizante = st.session_state['chat_historial'][-4:] if len(st.session_state['chat_historial']) >= 4 else st.session_state['chat_historial']
+                    
+                    # 2. Mostrar y guardar el mensaje del usuario
                     with st.chat_message("user"):
                         st.markdown(prompt)
                     st.session_state['chat_historial'].append({"role": "user", "content": prompt})
                     
-                    # 2. Generar y mostrar respuesta de Kromos
+                    # 3. Generar y mostrar respuesta de Kromos
                     with st.chat_message("assistant"):
-                        with st.spinner("Kromos está buscando en tu memoria..."):
+                        with st.spinner("Kromos está conectando recuerdos..."):
+                            # ¡AQUÍ PASAMOS LA VENTANA DESLIZANTE!
                             respuesta_ia, recuerdos_usados = simular_respuesta_avatar(
                                 st.session_state['user_id'], 
                                 nombre_usuario, 
-                                prompt
+                                prompt,
+                                ventana_deslizante
                             )
                             st.markdown(respuesta_ia)
                             
-                            # (Opcional) Modo Debug: Mostrar qué recuerdos recuperó la IA
-                            with st.expander("Ver recuerdos recuperados (Contexto RAG)"):
+                            with st.expander("Ver contexto inyectado (Modo Debug)"):
+                                st.markdown("**Memoria a Corto Plazo (Ventana):**")
+                                st.json(ventana_deslizante)
+                                st.markdown("**Memoria a Largo Plazo (ChromaDB):**")
                                 if recuerdos_usados:
                                     for r in recuerdos_usados:
                                         st.caption(f"💭 {r}")
                                 else:
-                                    st.caption("No se encontraron recuerdos específicos, se forzó la respuesta de fallback.")
+                                    st.caption("No se encontraron recuerdos específicos.")
                                     
-                    # 3. Guardar respuesta en el historial
+                    # 4. Guardar respuesta de la IA en el historial general
                     st.session_state['chat_historial'].append({"role": "assistant", "content": respuesta_ia})
 
 # ==========================================
