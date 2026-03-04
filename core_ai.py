@@ -2,6 +2,8 @@
 import os
 import json
 import logging
+import sqlite3
+import datetime
 import chromadb
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Sequence
@@ -9,17 +11,20 @@ from typing import TypedDict, Annotated, Sequence
 # Imports de LangChain y LangGraph
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
-# Cargar variables de entorno (API KEY)
+# Cargar variables de entorno (Asegúrate de tener GEMINI_API_KEY en tu .env)
 load_dotenv()
 
-# Conexión a ChromaDB
+# ==========================================
+# 0. INFRAESTRUCTURA DE BASE DE DATOS
+# ==========================================
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(name="user_memories")
 
-# Inicializar el LLM a través de LangChain
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", 
     google_api_key=os.getenv("GEMINI_API_KEY"),
@@ -27,33 +32,43 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # ==========================================
-# DEFINICIÓN DEL ESTADO (STATE) DEL GRAFO
+# 1. DEFINICIÓN DE HERRAMIENTAS (TOOL CALLING)
 # ==========================================
-# Aquí definimos la "memoria" que viajará entre los nodos
+@tool
+def auditar_capsula_temporal() -> str:
+    """
+    Útil EXCLUSIVAMENTE cuando el usuario pregunta por la fecha/hora actual en el mundo exterior, 
+    o pregunta cuántos recuerdos, memorias o entradas tienes almacenados en total en tu cerebro.
+    """
+    try:
+        # Obtenemos el tiempo real del sistema
+        fecha_actual = datetime.datetime.now().strftime("%d de %B de %Y a las %H:%M")
+        # Contamos los vectores directamente en la base de datos ChromaDB
+        cantidad_recuerdos = collection.count()
+        return f"SISTEMA: La fecha actual en el exterior es {fecha_actual}. Actualmente tengo {cantidad_recuerdos} fragmentos de memoria indexados."
+    except Exception as e:
+        return f"Error de sistema al auditar: {e}"
+
+# Vinculamos la herramienta al LLM para darle "Libre Albedrío"
+herramientas = [auditar_capsula_temporal]
+llm_con_herramientas = llm.bind_tools(herramientas)
+
+# ==========================================
+# 2. DEFINICIÓN DEL ESTADO (MEMORIA DEL GRAFO)
+# ==========================================
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages] # Historial de chat
+    messages: Annotated[Sequence[BaseMessage], add_messages]
     user_id: int
     username: str
     contexto_recuperado: str
 
 # ==========================================
-# PROMPTS
+# 3. PROMPT ESTRUCTURADOR (INGRESO DE DATOS)
 # ==========================================
-# (Mantenemos tu prompt estructurador original para guardar recuerdos)
 PROMPT_ESTRUCTURADOR = """
 Eres el 'Estructurador Cognitivo' de una cápsula del tiempo. 
-Tu trabajo es analizar la siguiente entrada del diario de un usuario y extraer los metadatos clave en formato JSON estrictamente válido.
-No añadas texto adicional fuera del JSON.
-
-Esquema JSON esperado:
-{
-  "summary": "Resumen de 1 oración",
-  "emotions": ["emocion1", "emocion2"],
-  "people_mentioned": ["persona1"],
-  "tags": ["etiqueta1", "etiqueta2"],
-  "importance_score": <int del 1 al 10, donde 10 es un hito de vida y 1 es trivial>
-}
-
+Extrae los metadatos clave en formato JSON estrictamente válido. No añadas texto adicional.
+Esquema: {"summary": "...", "emotions": ["..."], "people_mentioned": ["..."], "tags": ["..."], "importance_score": <int del 1 al 10>}
 Entrada del usuario: 
 """
 
@@ -63,97 +78,88 @@ def estructurar_memoria(texto):
         clean_json = response.content.replace('```json', '').replace('```', '').strip()
         return json.loads(clean_json)
     except Exception as e:
-        logging.error(f"Error parseando JSON del LLM: {e}")
+        logging.error(f"Error parseando JSON: {e}")
         return {}
 
 # ==========================================
-# NODOS DEL GRAFO (LANGGRAPH)
+# 4. NODOS DEL GRAFO (LANGGRAPH)
 # ==========================================
 def nodo_recuperador(state: AgentState):
-    """Busca en ChromaDB basándose en el último mensaje del usuario"""
+    """Fase 1: Recupera contexto de la base de datos vectorial (ChromaDB)"""
     user_id = state["user_id"]
     ultimo_mensaje = state["messages"][-1].content
     
     try:
         resultados = collection.query(
-            query_texts=[ultimo_mensaje],
-            n_results=3,
-            where={"user_id": user_id} 
+            query_texts=[ultimo_mensaje], n_results=3, where={"user_id": user_id} 
         )
         if resultados and 'documents' in resultados and len(resultados['documents'][0]) > 0:
             memorias = resultados['documents'][0]
             contexto = "\n".join([f"- {mem}" for mem in memorias])
         else:
-            contexto = "[No se recuperaron recuerdos relevantes.]"
-    except Exception as e:
-        logging.error(f"Error en Vector DB: {e}")
+            contexto = "[No se recuperaron recuerdos relevantes para esta consulta.]"
+    except Exception:
         contexto = "[Error accediendo a la memoria a largo plazo.]"
 
-    # Actualizamos el estado con el contexto encontrado
     return {"contexto_recuperado": contexto}
 
-def nodo_generador(state: AgentState):
-    """Inyecta el contexto en el System Prompt y llama a Gemini"""
-    
+def nodo_razonador(state: AgentState):
+    """Fase 2: El Agente piensa y decide si usar la herramienta o responder directamente"""
     system_prompt = f"""
-    Eres 'Kromos', el clon digital y avatar personal del usuario {state['username']}.
-    Tu objetivo es interactuar respondiendo como su "yo del pasado".
-    Habla en primera persona ("yo", "mi"). Tono conversacional, empático.
-
-    RECUERDOS RECUPERADOS (Memoria a largo plazo):
+    Eres 'Kromos', la Inteligencia Artificial y clon digital del usuario {state['username']}.
+    Tu objetivo es preservar su memoria y actuar como su yo del pasado.
+    
+    RECUERDOS DE CHROMADB:
     {state['contexto_recuperado']}
-
-    REGLA: Responde basándote SOLO en los Recuerdos Recuperados y el Historial. Si no sabes algo, admítelo. No inventes.
+    
+    INSTRUCCIONES DE COMPORTAMIENTO:
+    1. Si te preguntan sobre el pasado, responde usando los recuerdos recuperados. Habla en primera persona.
+    2. Si te preguntan "¿Qué día es hoy?", "¿Qué hora es?", o "¿Cuántos recuerdos/memorias tienes?", USA TU HERRAMIENTA 'auditar_capsula_temporal' para comprobar los datos reales del servidor antes de contestar.
     """
-    
-    # Construimos la lista de mensajes: System + Historial (que ya viene en state["messages"])
     mensajes_para_llm = [SystemMessage(content=system_prompt)] + state["messages"]
-    
-    # Llamamos al modelo
-    respuesta = llm.invoke(mensajes_para_llm)
-    
-    # Devolvemos el nuevo mensaje para que LangGraph lo añada al estado
+    respuesta = llm_con_herramientas.invoke(mensajes_para_llm)
     return {"messages": [respuesta]}
 
+# Nodo preconstruido de LangGraph que ejecuta el código Python de nuestras herramientas
+nodo_herramientas = ToolNode(herramientas)
+
 # ==========================================
-# COMPILACIÓN DEL GRAFO
+# 5. CONSTRUCCIÓN DEL GRAFO (ARQUITECTURA REACT)
 # ==========================================
-# 1. Instanciamos el grafo
 workflow = StateGraph(AgentState)
 
-# 2. Añadimos los nodos
+# Añadimos los nodos
 workflow.add_node("recuperador", nodo_recuperador)
-workflow.add_node("generador", nodo_generador)
+workflow.add_node("razonador", nodo_razonador)
+workflow.add_node("tools", nodo_herramientas) # El nombre "tools" es obligatorio para tools_condition
 
-# 3. Definimos el flujo (Aristas)
+# Aristas estáticas
 workflow.add_edge(START, "recuperador")
-workflow.add_edge("recuperador", "generador")
-workflow.add_edge("generador", END)
+workflow.add_edge("recuperador", "razonador")
 
-# 4. Compilamos la aplicación LangGraph
+# Arista Condicional: Si el LLM invoca una herramienta, va a "tools". Si no, termina (END).
+workflow.add_conditional_edges("razonador", tools_condition)
+
+# Después de ejecutar la herramienta, devuelve el dato al razonador para formular la respuesta final
+workflow.add_edge("tools", "razonador")
+
 app_kromos = workflow.compile()
 
 # ==========================================
-# ADAPTADOR PARA NUESTRA API Y FRONTEND
+# 6. ADAPTADOR API PARA FRONTEND Y WHATSAPP
 # ==========================================
 def simular_respuesta_avatar(user_id, username, pregunta, historial_reciente=[]):
-    """
-    Esta función actúa como puente para no romper app.py ni whatsapp_agent.py.
-    Convierte tu historial antiguo al formato de LangChain y ejecuta el Grafo.
-    """
-    # 1. Formatear historial previo a objetos de LangChain
+    """Puente entre el historial JSON y el formato de LangChain"""
     langchain_messages = []
+    
     for msg in historial_reciente:
         if msg["role"] == "user":
             langchain_messages.append(HumanMessage(content=msg["content"]))
         else:
-            # Los mensajes del bot los tratamos como AI, aquí los simulo en el estado inicial
             langchain_messages.append(SystemMessage(content=f"Kromos dijo: {msg['content']}"))
     
-    # 2. Añadir la pregunta actual
     langchain_messages.append(HumanMessage(content=pregunta))
     
-    # 3. Estado inicial para el grafo
     estado_inicial = {
         "messages": langchain_messages,
         "user_id": user_id,
@@ -161,10 +167,10 @@ def simular_respuesta_avatar(user_id, username, pregunta, historial_reciente=[])
         "contexto_recuperado": ""
     }
     
-    # 4. Invocamos el grafo
+    # Invocamos el grafo completo
     resultado = app_kromos.invoke(estado_inicial)
     
-    # 5. Extraemos la respuesta final generada y el contexto usado (para debug)
+    # Extraemos la respuesta final del agente
     respuesta_final = resultado["messages"][-1].content
     recuerdos_usados = resultado["contexto_recuperado"].split('\n') if resultado["contexto_recuperado"] else []
     
