@@ -49,8 +49,32 @@ def auditar_capsula_temporal() -> str:
     except Exception as e:
         return f"Error de sistema al auditar: {e}"
 
-# Vinculamos la herramienta al LLM para darle "Libre Albedrío"
-herramientas = [auditar_capsula_temporal]
+@tool
+def agendar_evento_capsula(fecha: str, titulo: str, descripcion: str) -> str:
+    """
+    ¡ATENCIÓN! REGLA HITL (Human-in-the-loop): 
+    NUNCA uses esta herramienta a menos que el usuario haya APROBADO EXPLÍCITAMENTE 
+    el borrador del evento. Si el usuario no ha dicho "sí", "ok", "adelante" o similar,
+    NO uses la herramienta todavía.
+    """
+    try:
+        conn = sqlite3.connect('temporal_eco.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS calendario_capsula
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      fecha TEXT, titulo TEXT, descripcion TEXT)''')
+        
+        c.execute("INSERT INTO calendario_capsula (fecha, titulo, descripcion) VALUES (?, ?, ?)",
+                  (fecha, titulo, descripcion))
+        conn.commit()
+        conn.close()
+        
+        return f"SISTEMA: Evento '{titulo}' agendado exitosamente en la base de datos para el {fecha}."
+    except Exception as e:
+        return f"Error del sistema al guardar el evento: {e}"
+
+# IMPORTANTE: Añade ambas herramientas a la lista
+herramientas = [auditar_capsula_temporal, agendar_evento_capsula]
 llm_con_herramientas = llm.bind_tools(herramientas)
 
 # ==========================================
@@ -105,16 +129,23 @@ def nodo_recuperador(state: AgentState):
 
 def nodo_razonador(state: AgentState):
     """Fase 2: El Agente piensa y decide si usar la herramienta o responder directamente"""
+    
+    hoy = datetime.datetime.now().strftime("%Y-%m-%d")
+    
     system_prompt = f"""
     Eres 'Kromos', la Inteligencia Artificial y clon digital del usuario {state['username']}.
-    Tu objetivo es preservar su memoria y actuar como su yo del pasado.
+    HOY ES: {hoy}
     
     RECUERDOS DE CHROMADB:
     {state['contexto_recuperado']}
     
-    INSTRUCCIONES DE COMPORTAMIENTO:
-    1. Si te preguntan sobre el pasado, responde usando los recuerdos recuperados. Habla en primera persona.
-    2. Si te preguntan "¿Qué día es hoy?", "¿Qué hora es?", o "¿Cuántos recuerdos/memorias tienes?", USA TU HERRAMIENTA 'auditar_capsula_temporal' para comprobar los datos reales del servidor antes de contestar.
+    INSTRUCCIONES DE COMPORTAMIENTO Y PROTOCOLO HITL (Human-In-The-Loop):
+    1. Si te preguntan sobre el pasado, responde usando los recuerdos recuperados.
+    2. Si te preguntan "¿Qué hora es?" o "¿Cuántos recuerdos tienes?", usa 'auditar_capsula_temporal'.
+    3. PROTOCOLO DE CALENDARIO (HITL STRICT):
+       - PASO A: Si el usuario te pide agendar algo por primera vez, NO uses la herramienta. Muéstrale un BORRADOR estructurado y pregúntale: "¿Me das el visto bueno?".
+       - PASO B: Si en el historial inmediato TÚ ya mostraste el borrador y el USUARIO acaba de decir "sí", "ok", "adelante", "guárdalo" o similar... ¡ENTONCES EL PERMISO ESTÁ CONCEDIDO! Usa la herramienta 'agendar_evento_capsula' INMEDIATAMENTE sin volver a preguntar.
+       - PASO C: Tras usar la herramienta con éxito, confirma que ya está en el calendario.
     """
     mensajes_para_llm = [SystemMessage(content=system_prompt)] + state["messages"]
     respuesta = llm_con_herramientas.invoke(mensajes_para_llm)
@@ -170,8 +201,17 @@ def simular_respuesta_avatar(user_id, username, pregunta, historial_reciente=[])
     # Invocamos el grafo completo
     resultado = app_kromos.invoke(estado_inicial)
     
-    # Extraemos la respuesta final del agente
-    respuesta_final = resultado["messages"][-1].content
+   # Extraemos la respuesta final del agente (A prueba de bloques multimodales)
+    raw_content = resultado["messages"][-1].content
+    
+    # Si Gemini nos devuelve una lista de bloques (como en tu captura)
+    if isinstance(raw_content, list):
+        # Extraemos solo el valor de la clave "text"
+        respuesta_final = raw_content[0].get("text", str(raw_content))
+    # Si nos devuelve texto plano estándar
+    else:
+        respuesta_final = str(raw_content)
+        
     recuerdos_usados = resultado["contexto_recuperado"].split('\n') if resultado["contexto_recuperado"] else []
     
     return respuesta_final, recuerdos_usados

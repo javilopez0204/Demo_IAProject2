@@ -9,3 +9,4 @@ python-dotenv>=1.0.0
 langchain-google-genai>=1.0.3
 langgraph>=0.0.39
 langchain-core>=0.1.45
+pandas>=2.0.0

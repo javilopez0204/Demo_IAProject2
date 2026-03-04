@@ -1,277 +1,223 @@
-#probando probando
-
-# ==========================================
-# PARCHE MULTIPLATAFORMA (LOCAL VS CLOUD)
-# ==========================================
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    pass # Si estamos en Windows local, usamos el sqlite3 nativo
-
+# app.py
 import streamlit as st
 import sqlite3
 import hashlib
-import time
-from datetime import datetime
+import pandas as pd
+import chromadb
+
+# Importamos las dos funciones clave de nuestro cerebro (LangGraph)
+from core_ai import estructurar_memoria, simular_respuesta_avatar
 
 # ==========================================
-# IMPORTACIÓN DEL MÓDULO DE IA (CEREBRO)
+# 1. CONFIGURACIÓN DE PÁGINA Y BASE DE DATOS
 # ==========================================
-from core_ai import estructurar_memoria, simular_respuesta_avatar, collection
+st.set_page_config(page_title="Kromos | Cápsula del Tiempo", page_icon="🧬", layout="centered")
 
-# ==========================================
-# 1. CONFIGURACIÓN Y CONEXIONES (SQLITE)
-# ==========================================
-conn = sqlite3.connect('temporal_eco.db', check_same_thread=False)
-c = conn.cursor()
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="user_memories")
 
-# 1. Creamos la tabla base si es un despliegue 100% nuevo
-c.execute('''CREATE TABLE IF NOT EXISTS users
-             (id INTEGER PRIMARY KEY, 
-              username TEXT UNIQUE, 
-              password TEXT, 
-              onboarding_done BOOLEAN)''')
+def init_db():
+    conn = sqlite3.connect('temporal_eco.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  username TEXT UNIQUE,
+                  password TEXT,
+                  avatar_created BOOLEAN DEFAULT 0,
+                  kromos_score INTEGER DEFAULT 0)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS calendario_capsula
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  fecha TEXT, titulo TEXT, descripcion TEXT)''')
+    conn.commit()
+    conn.close()
 
-# 2. SISTEMA DE MIGRACIÓN AUTOMÁTICA
-try:
-    c.execute("ALTER TABLE users ADD COLUMN kromos_score INTEGER DEFAULT 0")
-except Exception:
-    pass # La columna kromos_score ya existía
-
-try:
-    c.execute("ALTER TABLE users ADD COLUMN avatar_created BOOLEAN DEFAULT 0")
-except Exception:
-    pass # La columna avatar_created ya existía
-
-conn.commit()
+init_db()
 
 # ==========================================
-# 2. FUNCIONES DE BASE DE DATOS Y LÓGICA
+# 2. FUNCIONES DE AUTENTICACIÓN
 # ==========================================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def register_user(username, password):
+def login_user(username, password):
+    conn = sqlite3.connect('temporal_eco.db')
+    c = conn.cursor()
+    c.execute('SELECT id, kromos_score, avatar_created FROM users WHERE username=? AND password=?', (username, hash_password(password)))
+    data = c.fetchone()
+    conn.close()
+    return data
+
+def create_user(username, password):
+    conn = sqlite3.connect('temporal_eco.db')
+    c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (username, password, onboarding_done, kromos_score, avatar_created) VALUES (?, ?, ?, ?, ?)", 
-                  (username, hash_password(password), False, 0, False))
+        c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hash_password(password)))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False
+    finally:
+        conn.close()
 
-def login_user(username, password):
-    c.execute("SELECT id, username, onboarding_done, kromos_score, avatar_created FROM users WHERE username=? AND password=?", 
-              (username, hash_password(password)))
-    return c.fetchone()
-
-def guardar_memoria(user_id, texto):
-    # Usamos la función importada de core_ai.py
-    metadatos = estructurar_memoria(texto)
-    doc_id = f"{user_id}_{datetime.now().timestamp()}"
-    score_obtenido = metadatos.get("importance_score", 1)
+def update_user_score(user_id, points):
+    conn = sqlite3.connect('temporal_eco.db')
+    c = conn.cursor()
+    c.execute('SELECT kromos_score FROM users WHERE id=?', (user_id,))
+    current_score = c.fetchone()[0]
+    new_score = current_score + points
     
-    chroma_meta = {
-        "user_id": user_id,
-        "date": datetime.now().isoformat(),
-        "emotions": ",".join(metadatos.get("emotions", [])),
-        "people": ",".join(metadatos.get("people_mentioned", [])),
-        "importance": score_obtenido
-    }
+    avatar_created = 1 if new_score >= 50 else 0
     
-    # Guardamos en la colección vectorial (importada de core_ai.py)
-    collection.add(documents=[texto], metadatas=[chroma_meta], ids=[doc_id])
-    
-    # Guardamos en la BD relacional local
-    c.execute("UPDATE users SET kromos_score = kromos_score + ? WHERE id = ?", (score_obtenido, user_id))
+    c.execute('UPDATE users SET kromos_score=?, avatar_created=? WHERE id=?', (new_score, avatar_created, user_id))
     conn.commit()
-    st.session_state['kromos_score'] += score_obtenido
-    
-    return metadatos
+    conn.close()
+    return new_score, avatar_created
 
 # ==========================================
-# 3. COMPONENTES DE INTERFAZ (UI)
+# 3. LÓGICA DE MEMORIA (RAG)
 # ==========================================
-def renderizar_dashboard():
-    st.subheader("Tu Espacio Personal")
+def guardar_memoria(user_id, texto):
+    with st.spinner("Analizando cognitivamente tu recuerdo..."):
+        metadatos = estructurar_memoria(texto)
+        puntos = metadatos.get("importance_score", 5) 
+        
+        doc_id = f"user_{user_id}_mem_{hashlib.md5(texto.encode()).hexdigest()[:8]}"
+        collection.add(
+            documents=[texto],
+            metadatas=[{"user_id": user_id, "emotions": str(metadatos.get("emotions", [])), "score": puntos}],
+            ids=[doc_id]
+        )
+        
+        nuevo_score, avatar_listo = update_user_score(user_id, puntos)
+        return nuevo_score, avatar_listo
+
+# ==========================================
+# 4. INTERFAZ DE USUARIO (UI)
+# ==========================================
+if 'user_id' not in st.session_state:
+    st.title("🧬 Bienvenido a Kromos")
+    st.write("Tu ecosistema de memoria persistente y gemelo digital.")
     
-    if st.button("Cerrar Sesión"):
+    menu = st.radio("Menú", ["Iniciar Sesión", "Registrarse"])
+    
+    username = st.text_input("Usuario")
+    password = st.text_input("Contraseña", type="password")
+    
+    if menu == "Registrarse":
+        if st.button("Crear cuenta"):
+            if create_user(username, password):
+                st.success("Cuenta creada. Por favor, inicia sesión.")
+            else:
+                st.error("El usuario ya existe.")
+                
+    elif menu == "Iniciar Sesión":
+        if st.button("Entrar"):
+            user_data = login_user(username, password)
+            if user_data:
+                st.session_state['user_id'] = user_data[0]
+                st.session_state['username'] = username
+                st.session_state['score'] = user_data[1]
+                st.session_state['avatar_created'] = user_data[2]
+                st.session_state['chat_history'] = [] # Inicializamos el historial del chat web
+                st.rerun()
+            else:
+                st.error("Credenciales incorrectas.")
+
+else:
+    # ------------------------------------------
+    # PANTALLA PRINCIPAL (USUARIO LOGUEADO)
+    # ------------------------------------------
+    st.sidebar.title(f"👤 {st.session_state['username']}")
+    st.sidebar.progress(min(st.session_state['score'] / 50.0, 1.0), text=f"Sincronización: {st.session_state['score']}/50 pts")
+    
+    if st.sidebar.button("Cerrar Sesión"):
         st.session_state.clear()
         st.rerun()
 
-    KROMOS_TARGET = 50 
-    progreso_actual = min(st.session_state.get('kromos_score', 0), KROMOS_TARGET)
-    porcentaje = int((progreso_actual / KROMOS_TARGET) * 100)
-    
-    # Extraemos el nombre del usuario para el avatar
-    nombre_usuario = st.session_state.get('username', 'Usuario')
+    if st.session_state['score'] >= 50:
+        st.success("🔓 SISTEMA NEURONAL OPERATIVO. Kromos está listo.")
+    else:
+        st.warning(f"⚠️ Sincronización incompleta. Necesitas {50 - st.session_state['score']} puntos más para despertar al Avatar.")
 
-    tab_diario, tab_kromos = st.tabs(["📝 Mi Diario", "🧠 Kromos (Avatar)"])
+    tab1, tab2, tab3 = st.tabs(["💬 Chat Neural", "📝 Mi Diario", "🗓️ Calendario Futuro"])
 
-    # --- PESTAÑA DIARIO ---
-    with tab_diario:
-        nueva_entrada = st.text_area("¿Qué tienes en mente hoy? Escribe cómo te sientes, qué pasó, o reflexiones aleatorias.")
+    # --- PESTAÑA 1: CHAT NEURAL (RESTAURADO) ---
+    with tab1:
+        # Usamos columnas para alinear el título y el botón de reset
+        col_titulo, col_boton = st.columns([3, 1])
+        with col_titulo:
+            st.header("💬 Chat Local con Kromos")
+        with col_boton:
+            # BOTÓN DE NUEVA CONVERSACIÓN
+            if st.button("🗑️ Limpiar Chat"):
+                st.session_state['chat_history'] = []
+                st.rerun()
+
+        if st.session_state['score'] >= 50:
+            st.info("Puedes hablar con Kromos desde aquí o desde WhatsApp.")
+            
+            # 1. Mostrar historial de mensajes de la sesión web
+            for msg in st.session_state['chat_history']:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+            
+            # 2. Input del usuario
+            prompt = st.chat_input("Escribe tu mensaje a Kromos...")
+            if prompt:
+                with st.chat_message("user"):
+                    st.write(prompt)
+                
+                with st.spinner("Kromos está procesando..."):
+                    respuesta_final, recuerdos_usados = simular_respuesta_avatar(
+                        st.session_state['user_id'],
+                        st.session_state['username'],
+                        prompt,
+                        st.session_state['chat_history'] 
+                    )
+                
+                st.session_state['chat_history'].append({"role": "user", "content": prompt})
+                st.session_state['chat_history'].append({"role": "assistant", "content": respuesta_final})
+                
+                st.rerun()
+        else:
+            st.write("El núcleo cognitivo de Kromos aún está inactivo. Ve a 'Mi Diario' para darle contexto.")
+
+    # --- PESTAÑA 2: MI DIARIO ---
+    with tab2:
+        st.header("📝 Ingesta de Memoria")
+        st.write("Escribe un recuerdo o hito importante. Kromos lo analizará y lo integrará en su red neuronal.")
+        
+        nuevo_recuerdo = st.text_area("¿Qué quieres preservar en tu cápsula hoy?", height=150)
         
         if st.button("Guardar en la Cápsula"):
-            if nueva_entrada:
-                with st.spinner("Procesando memoria e integrando en la red neuronal..."):
-                    meta = guardar_memoria(st.session_state['user_id'], nueva_entrada)
-                    puntos = meta.get('importance_score', 1)
-                    
-                    # LOGICA DE CREACIÓN DEL AVATAR (Primera vez)
-                    if not st.session_state.get('avatar_created', False):
-                        c.execute("UPDATE users SET avatar_created = 1 WHERE id = ?", (st.session_state['user_id'],))
-                        conn.commit()
-                        st.session_state['avatar_created'] = True
-                        st.balloons()
-                        st.success("✨ ¡Tu Avatar ha sido creado! Revisa la pestaña 'Kromos'.")
-                        time.sleep(1.5)
-                        st.rerun() 
-                    else:
-                        st.success(f"Memoria guardada. ¡Avatar sincronizado +{puntos} puntos!")
-                        time.sleep(1)
-                        st.rerun() 
+            if nuevo_recuerdo:
+                nuevo_score, avatar_listo = guardar_memoria(st.session_state['user_id'], nuevo_recuerdo)
+                st.session_state['score'] = nuevo_score
+                st.session_state['avatar_created'] = avatar_listo
+                st.success("¡Memoria asimilada correctamente!")
+                if avatar_listo:
+                    st.balloons()
+                st.rerun()
             else:
-                st.warning("No puedes guardar un recuerdo vacío.")
+                st.error("El recuerdo no puede estar vacío.")
 
-   # --- PESTAÑA KROMOS ---
-    with tab_kromos:
-        # SI EL AVATAR AÚN NO HA SIDO CREADO
-        if not st.session_state.get('avatar_created', False):
-            st.info("🧬 **No hay ningún avatar asignado.**\n\nVe a 'Mi Diario' y escribe tu primera entrada libre para inicializar el núcleo de tu avatar.")
-            
-        # SI EL AVATAR YA ESTÁ CREADO
-        else:
-            st.markdown(f"## 👤 Avatar: {nombre_usuario}")
-            
-            # ESTADO BLOQUEADO (< 100%)
-            if porcentaje < 100:
-                st.error("🔒 **ESTADO: BLOQUEADO**")
-                st.progress(porcentaje / 100.0)
-                st.write(f"**Sincronización:** {porcentaje}% ({progreso_actual}/{KROMOS_TARGET} puntos)")
-                st.info("El avatar necesita más contexto emocional y vivencial para poder simular tu personalidad con precisión. Continúa escribiendo en 'Mi Diario'.")
-                
-            # ESTADO DESBLOQUEADO (100% -> CHAT RAG ACTIVO)
-            else:
-                st.success("🔓 **SISTEMA NEURONAL OPERATIVO**")
-                st.markdown("---")
-                
-                # Inicializar el historial de chat del avatar si no existe
-                if 'chat_historial' not in st.session_state:
-                    st.session_state['chat_historial'] = [
-                        {"role": "assistant", "content": f"Hola. Soy Kromos, tu reflejo digital al 100% de sincronización. ¿En qué recuerdo quieres que profundicemos hoy?"}
-                    ]
-                
-                # Renderizar el historial de chat visualmente
-                for mensaje in st.session_state['chat_historial']:
-                    with st.chat_message(mensaje["role"]):
-                        st.markdown(mensaje["content"])
-                
-                # Entrada de texto del usuario para el chat
-                if prompt := st.chat_input("Pregúntale algo a tu yo del pasado..."):
-                    
-                    ventana_deslizante = st.session_state['chat_historial'][-4:] if len(st.session_state['chat_historial']) >= 4 else st.session_state['chat_historial']
-                    
-                    with st.chat_message("user"):
-                        st.markdown(prompt)
-                    st.session_state['chat_historial'].append({"role": "user", "content": prompt})
-                    
-                    with st.chat_message("assistant"):
-                        with st.spinner("Kromos está conectando recuerdos..."):
-                            # Usamos la función importada de core_ai.py
-                            respuesta_ia, recuerdos_usados = simular_respuesta_avatar(
-                                st.session_state['user_id'], 
-                                nombre_usuario, 
-                                prompt,
-                                ventana_deslizante
-                            )
-                            st.markdown(respuesta_ia)
-                            
-                            with st.expander("Ver contexto inyectado (Modo Debug)"):
-                                st.markdown("**Memoria a Corto Plazo (Ventana):**")
-                                st.json(ventana_deslizante)
-                                st.markdown("**Memoria a Largo Plazo (ChromaDB):**")
-                                if recuerdos_usados:
-                                    for r in recuerdos_usados:
-                                        st.caption(f"💭 {r}")
-                                else:
-                                    st.caption("No se encontraron recuerdos específicos.")
-                                    
-                    st.session_state['chat_historial'].append({"role": "assistant", "content": respuesta_ia})
-
-# ==========================================
-# 4. CONTROLADOR PRINCIPAL (MAIN)
-# ==========================================
-def main():
-    st.title("⏳ Cápsula del Tiempo IA")
-
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = False
-        st.session_state['user_id'] = None
-        st.session_state['username'] = None
-        st.session_state['onboarding_done'] = False
-        st.session_state['kromos_score'] = 0
-        st.session_state['avatar_created'] = False
-
-    # PANTALLA DE LOGIN / REGISTRO
-    if not st.session_state['logged_in']:
-        tab1, tab2 = st.tabs(["Iniciar Sesión", "Registrarse"])
+    # --- PESTAÑA 3: CALENDARIO FUTURO ---
+    with tab3:
+        st.header("🗓️ Tu Visión Futura (Calendario)")
+        st.write("Aquí se muestran los eventos que Kromos ha agendado autónomamente.")
         
-        with tab1:
-            u_login = st.text_input("Usuario (Login)")
-            p_login = st.text_input("Contraseña (Login)", type="password")
-            if st.button("Entrar"):
-                user_data = login_user(u_login, p_login)
-                if user_data:
-                    st.session_state['logged_in'] = True
-                    st.session_state['user_id'] = user_data[0]
-                    st.session_state['username'] = user_data[1] 
-                    st.session_state['onboarding_done'] = user_data[2]
-                    st.session_state['kromos_score'] = user_data[3]
-                    st.session_state['avatar_created'] = bool(user_data[4])
-                    st.rerun()
-                else:
-                    st.error("Credenciales incorrectas")
-                    
-        with tab2:
-            u_reg = st.text_input("Usuario (Registro)")
-            p_reg = st.text_input("Contraseña (Registro)", type="password")
-            if st.button("Crear cuenta"):
-                if register_user(u_reg, p_reg):
-                    st.success("Cuenta creada. Inicia sesión.")
-                else:
-                    st.error("El usuario ya existe.")
-
-    # PANTALLA DE ONBOARDING
-    elif not st.session_state['onboarding_done']:
-        st.subheader("Cuestionario de Inicialización")
-        with st.form("onboarding_form"):
-            q1 = st.text_area("1. ¿Cuáles son tus valores principales en la vida?")
-            q2 = st.text_area("2. Describe un evento de tu pasado que te cambió profundamente.")
-            q3 = st.text_area("3. ¿Cuáles son tus mayores miedos y esperanzas?")
+        try:
+            conn = sqlite3.connect('temporal_eco.db')
+            df = pd.read_sql_query("SELECT fecha as Fecha, titulo as Título, descripcion as Descripción FROM calendario_capsula ORDER BY fecha ASC", conn)
+            conn.close()
             
-            submitted = st.form_submit_button("Guardar mi perfil base")
-            if submitted:
-                if q1 and q2 and q3:
-                    with st.spinner("Procesando memorias base..."):
-                        guardar_memoria(st.session_state['user_id'], f"Valores principales: {q1}")
-                        guardar_memoria(st.session_state['user_id'], f"Evento que me cambió: {q2}")
-                        guardar_memoria(st.session_state['user_id'], f"Miedos y esperanzas: {q3}")
-                        
-                        c.execute("UPDATE users SET onboarding_done = 1 WHERE id = ?", (st.session_state['user_id'],))
-                        conn.commit()
-                        st.session_state['onboarding_done'] = True
-                        st.success("¡Perfil base creado! Pasando a tu cápsula...")
-                        time.sleep(1)
-                        st.rerun()
-                else:
-                    st.warning("Por favor responde a todas las preguntas para inicializar tu perfil.")
-
-    # DASHBOARD PRINCIPAL
-    else:
-        renderizar_dashboard()
-
-if __name__ == '__main__':
-    main()
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                # Botón útil para refrescar la tabla si agendas algo por WhatsApp mientras tienes la web abierta
+                if st.button("🔄 Refrescar Calendario"):
+                    st.rerun()
+            else:
+                st.info("No tienes eventos futuros programados. Pídele a Kromos en el chat que te recuerde algo.")
+        except Exception as e:
+            st.info("No tienes eventos futuros programados. Pídele a Kromos en el chat que te recuerde algo.")
