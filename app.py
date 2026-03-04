@@ -1,3 +1,13 @@
+# ==========================================
+# PARCHE MULTIPLATAFORMA (LOCAL VS CLOUD)
+# ==========================================
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass # Si estamos en Windows local, usamos el sqlite3 nativo
+
 import streamlit as st
 import sqlite3
 import hashlib
