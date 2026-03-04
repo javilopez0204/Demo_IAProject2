@@ -29,6 +29,10 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS calendario_capsula
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   fecha TEXT, titulo TEXT, descripcion TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS plan_accion
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  fecha TEXT, titulo TEXT, descripcion TEXT)''')
     conn.commit()
     conn.close()
 
@@ -140,7 +144,8 @@ else:
     else:
         st.warning(f"⚠️ Sincronización incompleta. Necesitas {50 - st.session_state['score']} puntos más para despertar al Avatar.")
 
-    tab1, tab2, tab3 = st.tabs(["💬 Chat Neural", "📝 Mi Diario", "🗓️ Calendario Futuro"])
+
+    tab1, tab2, tab3, tab4 = st.tabs(["💬 Chat Neural", "📝 Mi Diario", "📋 Plan de Acción", "🗓️ Calendario Futuro"])
 
     # --- PESTAÑA 1: CHAT NEURAL (RESTAURADO) ---
     with tab1:
@@ -202,8 +207,45 @@ else:
             else:
                 st.error("El recuerdo no puede estar vacío.")
 
-    # --- PESTAÑA 3: CALENDARIO FUTURO ---
+    # --- PESTAÑA 3: PLAN DE ACCIÓN (SALA DE ESPERA) ---
     with tab3:
+        st.header("📋 Revisión del Plan de Acción")
+        st.write("Kromos ha generado este desglose de tareas. Revísalo antes de enviarlo a tu calendario oficial.")
+        
+        try:
+            conn = sqlite3.connect('temporal_eco.db')
+            df_plan = pd.read_sql_query("SELECT fecha as Fecha, titulo as Título, descripcion as Descripción FROM plan_accion ORDER BY fecha ASC", conn)
+            
+            if not df_plan.empty:
+                st.dataframe(df_plan, use_container_width=True, hide_index=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ Aprobar y Agendar Todo", use_container_width=True):
+                        c = conn.cursor()
+                        # Movemos todo del plan al calendario oficial
+                        c.execute("INSERT INTO calendario_capsula (fecha, titulo, descripcion) SELECT fecha, titulo, descripcion FROM plan_accion")
+                        # Vaciamos la sala de espera
+                        c.execute("DELETE FROM plan_accion")
+                        conn.commit()
+                        st.success("¡Plan transferido al calendario exitosamente!")
+                        st.rerun()
+                
+                with col2:
+                    if st.button("❌ Descartar Plan", type="primary", use_container_width=True):
+                        c = conn.cursor()
+                        c.execute("DELETE FROM plan_accion")
+                        conn.commit()
+                        st.warning("Plan descartado.")
+                        st.rerun()
+            else:
+                st.info("No hay ningún plan de acción pendiente de revisión.")
+            conn.close()
+        except Exception as e:
+            st.error(f"Error al cargar el plan: {e}")
+
+    # --- PESTAÑA 4: CALENDARIO FUTURO ---
+    with tab4:
         st.header("🗓️ Tu Visión Futura (Calendario)")
         st.write("Aquí se muestran los eventos que Kromos ha agendado autónomamente.")
         

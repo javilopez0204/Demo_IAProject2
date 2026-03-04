@@ -73,8 +73,41 @@ def agendar_evento_capsula(fecha: str, titulo: str, descripcion: str) -> str:
     except Exception as e:
         return f"Error del sistema al guardar el evento: {e}"
 
-# IMPORTANTE: Añade ambas herramientas a la lista
-herramientas = [auditar_capsula_temporal, agendar_evento_capsula]
+@tool
+def proponer_plan_accion(tareas_json: str) -> str:
+    """
+    Usa esta herramienta EXCLUSIVAMENTE cuando el usuario te pida organizar, planificar 
+    o desglosar un proyecto/tarea compleja en varios pasos.
+    Args:
+        tareas_json: Un string en formato JSON válido que contenga una lista de objetos. 
+                     Cada objeto debe tener: "fecha" (YYYY-MM-DD), "titulo" (resumen corto) y "descripcion" (detalles).
+    """
+    try:
+        tareas = json.loads(tareas_json)
+        conn = sqlite3.connect('temporal_eco.db')
+        c = conn.cursor()
+        
+        # Creamos la tabla "sala de espera" si no existe
+        c.execute('''CREATE TABLE IF NOT EXISTS plan_accion
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      fecha TEXT, titulo TEXT, descripcion TEXT)''')
+        
+        # Borramos cualquier plan anterior que no se haya aprobado (para no mezclar)
+        c.execute("DELETE FROM plan_accion")
+        
+        # Insertamos las nuevas tareas del plan
+        for t in tareas:
+            c.execute("INSERT INTO plan_accion (fecha, titulo, descripcion) VALUES (?, ?, ?)",
+                      (t.get("fecha"), t.get("titulo"), t.get("descripcion")))
+        conn.commit()
+        conn.close()
+        
+        return "SISTEMA: Plan de acción generado y guardado en la base de datos temporal. Dile al usuario que vaya a la pestaña 'Plan de Acción' para revisarlo y aprobarlo."
+    except Exception as e:
+        return f"Error del sistema al parsear el JSON o guardar el plan: {e}"
+
+# ¡CRÍTICO! Añade la nueva herramienta a la lista vinculada al LLM
+herramientas = [auditar_capsula_temporal, agendar_evento_capsula, proponer_plan_accion]
 llm_con_herramientas = llm.bind_tools(herramientas)
 
 # ==========================================
@@ -139,13 +172,11 @@ def nodo_razonador(state: AgentState):
     RECUERDOS DE CHROMADB:
     {state['contexto_recuperado']}
     
-    INSTRUCCIONES DE COMPORTAMIENTO Y PROTOCOLO HITL (Human-In-The-Loop):
-    1. Si te preguntan sobre el pasado, responde usando los recuerdos recuperados.
+    INSTRUCCIONES DE COMPORTAMIENTO:
+    1. Si te preguntan sobre el pasado, responde usando recuerdos recuperados.
     2. Si te preguntan "¿Qué hora es?" o "¿Cuántos recuerdos tienes?", usa 'auditar_capsula_temporal'.
-    3. PROTOCOLO DE CALENDARIO (HITL STRICT):
-       - PASO A: Si el usuario te pide agendar algo por primera vez, NO uses la herramienta. Muéstrale un BORRADOR estructurado y pregúntale: "¿Me das el visto bueno?".
-       - PASO B: Si en el historial inmediato TÚ ya mostraste el borrador y el USUARIO acaba de decir "sí", "ok", "adelante", "guárdalo" o similar... ¡ENTONCES EL PERMISO ESTÁ CONCEDIDO! Usa la herramienta 'agendar_evento_capsula' INMEDIATAMENTE sin volver a preguntar.
-       - PASO C: Tras usar la herramienta con éxito, confirma que ya está en el calendario.
+    3. PROTOCOLO DE CALENDARIO (HITL STRICT): Si te piden agendar UNA sola cosa concreta, pide permiso (borrador en texto) y si dicen sí, usa 'agendar_evento_capsula'.
+    4. PROTOCOLO DE PLANIFICACIÓN (Plan-and-Solve): Si el usuario te pide PLANIFICAR un proyecto complejo, organizar un viaje, o desglosar un objetivo en varios días, USA LA HERRAMIENTA 'proponer_plan_accion' generando un JSON con los pasos distribuidos en los próximos días. Luego, dile al usuario: "He preparado un plan detallado. Por favor, ve a la pestaña '📋 Plan de Acción' en tu panel para revisarlo y enviarlo al calendario."
     """
     mensajes_para_llm = [SystemMessage(content=system_prompt)] + state["messages"]
     respuesta = llm_con_herramientas.invoke(mensajes_para_llm)
