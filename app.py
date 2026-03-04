@@ -8,27 +8,17 @@ sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import streamlit as st
 import sqlite3
 import hashlib
-import json
 import time
 from datetime import datetime
-import google.generativeai as genai
-import chromadb
 
 # ==========================================
-# 1. CONFIGURACIÓN Y CONEXIONES
+# IMPORTACIÓN DEL MÓDULO DE IA (CEREBRO)
 # ==========================================
-try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    genai.configure(api_key=api_key)
-except KeyError:
-    st.error("🚨 Error crítico: La clave 'GEMINI_API_KEY' no está configurada en los secretos de Streamlit.")
-    st.stop()
+from core_ai import estructurar_memoria, simular_respuesta_avatar, collection
 
-model = genai.GenerativeModel('gemini-2.5-flash')
-
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection(name="user_memories")
-
+# ==========================================
+# 1. CONFIGURACIÓN Y CONEXIONES (SQLITE)
+# ==========================================
 conn = sqlite3.connect('temporal_eco.db', check_same_thread=False)
 c = conn.cursor()
 
@@ -40,8 +30,6 @@ c.execute('''CREATE TABLE IF NOT EXISTS users
               onboarding_done BOOLEAN)''')
 
 # 2. SISTEMA DE MIGRACIÓN AUTOMÁTICA
-# Intentamos añadir las nuevas columnas a la tabla existente. 
-# Si ya existen, SQLite lanzará un error que ignoramos silenciosamente.
 try:
     c.execute("ALTER TABLE users ADD COLUMN kromos_score INTEGER DEFAULT 0")
 except Exception:
@@ -55,102 +43,7 @@ except Exception:
 conn.commit()
 
 # ==========================================
-# 2. LÓGICA DE IA Y PROMPT ENGINEERING
-# ==========================================
-PROMPT_ESTRUCTURADOR = """
-Eres el 'Estructurador Cognitivo' de una cápsula del tiempo. 
-Tu trabajo es analizar la siguiente entrada del diario de un usuario y extraer los metadatos clave en formato JSON estrictamente válido.
-No añadas texto adicional fuera del JSON.
-
-Esquema JSON esperado:
-{
-  "summary": "Resumen de 1 oración",
-  "emotions": ["emocion1", "emocion2"],
-  "people_mentioned": ["persona1"],
-  "tags": ["etiqueta1", "etiqueta2"],
-  "importance_score": <int del 1 al 10, donde 10 es un hito de vida y 1 es trivial>
-}
-
-Entrada del usuario: 
-"""
-
-def estructurar_memoria(texto):
-    response = model.generate_content(PROMPT_ESTRUCTURADOR + texto)
-    try:
-        clean_json = response.text.replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        st.error(f"Error parseando JSON del LLM: {e}")
-        return {}
-    
-  # ==========================================
-# MOTOR RAG: SIMULADOR DE AVATAR (ACTUALIZADO)
-# ==========================================
-PROMPT_SIMULADOR = """
-Eres 'Kromos', el clon digital y avatar personal del usuario {nombre_usuario}.
-Tu objetivo es interactuar con el usuario respondiendo a sus preguntas como si fueras su "yo del pasado" o su reflejo digital.
-Habla siempre en primera persona ("yo", "mi", "nosotros"). Tienes un tono conversacional, empático y reflexivo.
-
-REGLA DE ORO DE ARQUITECTURA COGNITIVA: 
-1. Responde basándote EXCLUSIVAMENTE en los "Recuerdos Recuperados" (memoria a largo plazo) y en el "Historial de la Conversación" (memoria a corto plazo).
-2. Si la respuesta requiere información que no está en tu memoria, admite tu limitación (ej. "Aún no tengo recuerdos claros sobre eso, cuéntame más").
-3. ¡NO INVENTES VIVENCIAS, NOMBRES NI EMOCIONES!
-
-HISTORIAL DE LA CONVERSACIÓN RECIENTE (Memoria a corto plazo):
-{historial_conversacion}
-
-RECUERDOS RECUPERADOS (Memoria a largo plazo):
-{contexto}
-
-PREGUNTA ACTUAL DEL USUARIO:
-{pregunta}
-"""
-
-def recuperar_memorias(user_id, pregunta, top_k=5):
-    try:
-        resultados = collection.query(
-            query_texts=[pregunta],
-            n_results=top_k,
-            where={"user_id": user_id} 
-        )
-        if resultados and 'documents' in resultados and len(resultados['documents'][0]) > 0:
-            return resultados['documents'][0]
-        return []
-    except Exception as e:
-        st.error(f"Error en la base de datos vectorial: {e}")
-        return []
-
-def simular_respuesta_avatar(user_id, username, pregunta, historial_reciente):
-    # 1. Retrieval (Memoria a largo plazo)
-    memorias = recuperar_memorias(user_id, pregunta)
-    
-    if not memorias:
-        contexto = "[No se recuperaron recuerdos relevantes.]"
-    else:
-        contexto = "\n".join([f"- {mem}" for mem in memorias])
-        
-    # 2. Formateo de la Ventana Deslizante (Memoria a corto plazo)
-    historial_str = ""
-    if historial_reciente:
-        for msg in historial_reciente:
-            rol = "Usuario" if msg["role"] == "user" else "Kromos"
-            historial_str += f"{rol}: {msg['content']}\n"
-    else:
-        historial_str = "[Inicio de la conversación]"
-        
-    # 3. Augmented Generation
-    prompt_final = PROMPT_SIMULADOR.format(
-        nombre_usuario=username, 
-        historial_conversacion=historial_str,
-        contexto=contexto, 
-        pregunta=pregunta
-    )
-    
-    response = model.generate_content(prompt_final)
-    return response.text, memorias
-
-# ==========================================
-# 3. FUNCIONES DE BASE DE DATOS Y LÓGICA
+# 2. FUNCIONES DE BASE DE DATOS Y LÓGICA
 # ==========================================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -164,13 +57,13 @@ def register_user(username, password):
     except sqlite3.IntegrityError:
         return False
 
-# MODIFICACIÓN: Ahora recuperamos el username en la posición 1
 def login_user(username, password):
     c.execute("SELECT id, username, onboarding_done, kromos_score, avatar_created FROM users WHERE username=? AND password=?", 
               (username, hash_password(password)))
     return c.fetchone()
 
 def guardar_memoria(user_id, texto):
+    # Usamos la función importada de core_ai.py
     metadatos = estructurar_memoria(texto)
     doc_id = f"{user_id}_{datetime.now().timestamp()}"
     score_obtenido = metadatos.get("importance_score", 1)
@@ -182,8 +75,11 @@ def guardar_memoria(user_id, texto):
         "people": ",".join(metadatos.get("people_mentioned", [])),
         "importance": score_obtenido
     }
+    
+    # Guardamos en la colección vectorial (importada de core_ai.py)
     collection.add(documents=[texto], metadatas=[chroma_meta], ids=[doc_id])
     
+    # Guardamos en la BD relacional local
     c.execute("UPDATE users SET kromos_score = kromos_score + ? WHERE id = ?", (score_obtenido, user_id))
     conn.commit()
     st.session_state['kromos_score'] += score_obtenido
@@ -191,7 +87,7 @@ def guardar_memoria(user_id, texto):
     return metadatos
 
 # ==========================================
-# 4. COMPONENTES DE INTERFAZ (UI)
+# 3. COMPONENTES DE INTERFAZ (UI)
 # ==========================================
 def renderizar_dashboard():
     st.subheader("Tu Espacio Personal")
@@ -226,12 +122,12 @@ def renderizar_dashboard():
                         st.session_state['avatar_created'] = True
                         st.balloons()
                         st.success("✨ ¡Tu Avatar ha sido creado! Revisa la pestaña 'Kromos'.")
-                        time.sleep(1.5) # Pequeña pausa para que el usuario lea el mensaje
-                        st.rerun() # FORZAMOS EL RE-RENDERIZADO PARA ACTUALIZAR LA OTRA PESTAÑA
+                        time.sleep(1.5)
+                        st.rerun() 
                     else:
                         st.success(f"Memoria guardada. ¡Avatar sincronizado +{puntos} puntos!")
                         time.sleep(1)
-                        st.rerun() # Forzamos recarga para ver avanzar la barra
+                        st.rerun() 
             else:
                 st.warning("No puedes guardar un recuerdo vacío.")
 
@@ -271,19 +167,15 @@ def renderizar_dashboard():
                 # Entrada de texto del usuario para el chat
                 if prompt := st.chat_input("Pregúntale algo a tu yo del pasado..."):
                     
-                    # 1. Extraer la ventana deslizante ANTES de añadir el nuevo mensaje
-                    # Tomamos los últimos 4 mensajes (2 interacciones completas de ida y vuelta)
                     ventana_deslizante = st.session_state['chat_historial'][-4:] if len(st.session_state['chat_historial']) >= 4 else st.session_state['chat_historial']
                     
-                    # 2. Mostrar y guardar el mensaje del usuario
                     with st.chat_message("user"):
                         st.markdown(prompt)
                     st.session_state['chat_historial'].append({"role": "user", "content": prompt})
                     
-                    # 3. Generar y mostrar respuesta de Kromos
                     with st.chat_message("assistant"):
                         with st.spinner("Kromos está conectando recuerdos..."):
-                            # ¡AQUÍ PASAMOS LA VENTANA DESLIZANTE!
+                            # Usamos la función importada de core_ai.py
                             respuesta_ia, recuerdos_usados = simular_respuesta_avatar(
                                 st.session_state['user_id'], 
                                 nombre_usuario, 
@@ -302,11 +194,10 @@ def renderizar_dashboard():
                                 else:
                                     st.caption("No se encontraron recuerdos específicos.")
                                     
-                    # 4. Guardar respuesta de la IA en el historial general
                     st.session_state['chat_historial'].append({"role": "assistant", "content": respuesta_ia})
 
 # ==========================================
-# 5. CONTROLADOR PRINCIPAL (MAIN)
+# 4. CONTROLADOR PRINCIPAL (MAIN)
 # ==========================================
 def main():
     st.title("⏳ Cápsula del Tiempo IA")
@@ -331,7 +222,7 @@ def main():
                 if user_data:
                     st.session_state['logged_in'] = True
                     st.session_state['user_id'] = user_data[0]
-                    st.session_state['username'] = user_data[1] # Guardamos el nombre
+                    st.session_state['username'] = user_data[1] 
                     st.session_state['onboarding_done'] = user_data[2]
                     st.session_state['kromos_score'] = user_data[3]
                     st.session_state['avatar_created'] = bool(user_data[4])
