@@ -8,13 +8,12 @@ import sqlite3
 app = FastAPI(title="Kromos WhatsApp Agent")
 
 # Conexión de solo lectura a SQLite para validar al usuario
+# Conexión de solo lectura a SQLite para validar al usuario
 def get_user_data(phone_number):
-    # Para un MVP, podemos asumir un ID de usuario fijo (ej. ID=1) 
-    # o mapear números de teléfono en tu BD. 
-    # Asumamos que Kromos responde por el usuario 1:
     conn = sqlite3.connect('temporal_eco.db')
     c = conn.cursor()
-    c.execute("SELECT id, username, avatar_created FROM users WHERE id=1")
+    # MODIFICACIÓN: En lugar de buscar el id=1, buscamos al último usuario registrado.
+    c.execute("SELECT id, username, avatar_created FROM users ORDER BY id DESC LIMIT 1")
     user = c.fetchone()
     conn.close()
     return user
